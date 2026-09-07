@@ -30,23 +30,24 @@ The WSL Ubuntu host owns virtualization, cloud-image tooling, SSH, `kubectl`, an
 
 ```mermaid
 flowchart TB
-    W[Windows 11 host] --> S[WSL2 Ubuntu 24.04<br/>operator host]
-    S --> PF[preflight.sh --dedicated]
-    PF --> K[/dev/kvm + QEMU/KVM/]
-    K --> L[libvirt: cka-net<br/>192.168.56.0/24 NAT]
-    L --> CP[k8s-cp01<br/>192.168.56.10<br/>2 vCPU · 3 GiB · 20 GiB]
-    L --> WK[k8s-worker01<br/>192.168.56.11<br/>2 vCPU · 2 GiB · 20 GiB]
-    CP --> API[kube-apiserver :6443]
-    CP --> ETCD[etcd]
-    CP --> CM[controller-manager]
-    CP --> SCH[scheduler]
-    CP --> KL1[kubelet + containerd]
-    WK --> KL2[kubelet + containerd<br/>worker role label]
-    CP <-. node API traffic .-> WK
-    CP <-. Calico Pod network<br/>10.244.0.0/16 .-> WK
-    S --> KC[~/.kube/cka-lab<br/>kubectl]
-    KC --> API
+    windows["Windows 11 host"] --> wsl["WSL2 Ubuntu 24.04 operator host"]
+    wsl --> preflight["preflight dedicated"]
+    preflight --> hypervisor["KVM and libvirt"]
+    hypervisor --> network["cka-net 192.168.56.0/24"]
+    network --> controlplane["k8s-cp01 192.168.56.10"]
+    network --> worker["k8s-worker01 192.168.56.11"]
+    controlplane --> apiserver["kube-apiserver TCP 6443"]
+    controlplane --> etcd["etcd"]
+    controlplane --> controller["controller-manager"]
+    controlplane --> scheduler["scheduler"]
+    controlplane --> cpnode["kubelet and containerd"]
+    worker --> workernode["kubelet and containerd"]
+    controlplane --- worker
+    wsl --> kubeconfig["kubeconfig cka-lab"]
+    kubeconfig --> apiserver
 ```
+
+The direct control-plane-to-worker link carries node API traffic on TCP 6443 and Calico Pod traffic for `10.244.0.0/16`.
 
 ## Node bootstrap chain
 

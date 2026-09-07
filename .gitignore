@@ -5,7 +5,7 @@
 
 # Local SSH trust state for recreated VM host keys.
 /.known_hosts
-
+/*original*
 # Local editor and operating-system metadata.
 .DS_Store
 .vscode/
