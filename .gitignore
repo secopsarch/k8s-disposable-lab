@@ -1,0 +1,11 @@
+# Large, disposable KVM artifacts. The recreation scripts generate them.
+/images/
+/disks/
+/seed/
+
+# Local SSH trust state for recreated VM host keys.
+/.known_hosts
+
+# Local editor and operating-system metadata.
+.DS_Store
+.vscode/
