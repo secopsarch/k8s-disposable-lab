@@ -198,18 +198,6 @@ Kubernetes overlay inside the VMs
 
 The VMs can reach package registries through libvirt NAT. Node-to-node Kubernetes traffic stays on the libvirt network. Calico supplies Pod networking; CoreDNS and workload Pods are not healthy until the CNI is installed.
 
-## What went wrong during the first build—and the fixes
-
-| Symptom | Cause | Permanent fix |
-| --- | --- | --- |
-| `cloud-localds: command not found` | Cloud-image tooling was absent | Install `cloud-image-utils`. |
-| SSH returned `Permission denied (publickey)` | User-data still contained a literal key placeholder | Generate user-data from `~/.ssh/cka_lab.pub`; `recreate.sh` does this every time. |
-| Cloud-init YAML looked valid but packages did not install | YAML indentation placed `packages` / `runcmd` inside the user item | Generate YAML using `printf` in the script, then validate with `cloud-init schema`. |
-| QEMU could not read files under `/home/devops` | The libvirt QEMU account could not traverse the private home directory | Grant only traversal: `sudo setfacl -m u:libvirt-qemu:--x "$HOME"`. |
-| `libvirtd` or `virtqemud` reported inactive | Ubuntu can use socket activation for modular libvirt daemons | Confirm `virsh -c qemu:///system uri`; the service activates when a domain starts. |
-| `virsh domifaddr` initially had no address | Guest agent had not reported yet | Use `sudo virsh net-dhcp-leases default`; cloud-init enables `qemu-guest-agent`. |
-| Worker was `NotReady` just after join | Calico and kube-proxy were still starting | Wait briefly and check `kubectl get pods -A`; this is normal during CNI initialization. |
-
 ## Troubleshooting commands
 
 ```bash
@@ -231,9 +219,3 @@ kubectl get pods -A -o wide
 kubectl get events -A --sort-by=.lastTimestamp
 ```
 
-## Optional next improvements
-
-- Add DHCP reservations for stable node IPs.
-- Snapshot a clean, Ready cluster with libvirt before failure drills.
-- Practice `kubeadm reset`, certificate inspection, node drains, CNI failures, kubelet failures, and container runtime failures.
-- Keep the base Ubuntu image read-only; all VM changes belong in disposable qcow2 overlays.
