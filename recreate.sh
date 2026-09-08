@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the complete two-node CKA practice cluster from the retained Ubuntu cloud image.
+# Rebuild a two-node cluster, or a three-node cluster when WORKER2_* variables are supplied.
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -14,10 +14,17 @@ POD_CIDR="10.244.0.0/16"
 LAB_NETWORK="${LAB_NETWORK:-default}"
 CP_STATIC_IP="${CP_STATIC_IP:-}"
 WORKER_STATIC_IP="${WORKER_STATIC_IP:-}"
+WORKER2_STATIC_IP="${WORKER2_STATIC_IP:-}"
 CP_MAC="${CP_MAC:-}"
 WORKER_MAC="${WORKER_MAC:-}"
+WORKER2_MAC="${WORKER2_MAC:-}"
 CONTROL_PLANE_ENDPOINT="${CONTROL_PLANE_ENDPOINT:-}"
 KUBECONFIG_TARGET="${KUBECONFIG_TARGET:-}"
+THREE_NODE=false
+if [[ -n $WORKER2_STATIC_IP || -n $WORKER2_MAC ]]; then
+  [[ -n $WORKER2_STATIC_IP && -n $WORKER2_MAC ]] || { echo "WORKER2_STATIC_IP and WORKER2_MAC must be supplied together" >&2; exit 2; }
+  THREE_NODE=true
+fi
 
 require() { command -v "$1" >/dev/null || { echo "Missing required command: $1" >&2; exit 1; }; }
 for command in cloud-localds qemu-img virt-install virsh ssh ssh-keygen curl cloud-init setfacl timeout; do require "$command"; done
@@ -62,14 +69,18 @@ write_user_data() {
 
 write_user_data k8s-cp01 "$SEED_DIR/cp-user-data"
 write_user_data k8s-worker01 "$SEED_DIR/worker-user-data"
+if [[ $THREE_NODE == true ]]; then write_user_data k8s-worker02 "$SEED_DIR/worker02-user-data"; fi
 printf 'instance-id: k8s-cp01\nlocal-hostname: k8s-cp01\n' > "$SEED_DIR/cp-meta-data"
 printf 'instance-id: k8s-worker01\nlocal-hostname: k8s-worker01\n' > "$SEED_DIR/worker-meta-data"
+if [[ $THREE_NODE == true ]]; then printf 'instance-id: k8s-worker02\nlocal-hostname: k8s-worker02\n' > "$SEED_DIR/worker02-meta-data"; fi
 
 cloud-localds "$SEED_DIR/cp-seed.iso" "$SEED_DIR/cp-user-data" "$SEED_DIR/cp-meta-data"
 cloud-localds "$SEED_DIR/worker-seed.iso" "$SEED_DIR/worker-user-data" "$SEED_DIR/worker-meta-data"
+if [[ $THREE_NODE == true ]]; then cloud-localds "$SEED_DIR/worker02-seed.iso" "$SEED_DIR/worker02-user-data" "$SEED_DIR/worker02-meta-data"; fi
 
 qemu-img create -f qcow2 -F qcow2 -b "$IMAGE" "$DISK_DIR/k8s-cp01.qcow2" 20G
 qemu-img create -f qcow2 -F qcow2 -b "$IMAGE" "$DISK_DIR/k8s-worker01.qcow2" 20G
+if [[ $THREE_NODE == true ]]; then qemu-img create -f qcow2 -F qcow2 -b "$IMAGE" "$DISK_DIR/k8s-worker02.qcow2" 20G; fi
 
 create_vm() {
   local name=$1 memory=$2 disk=$3 seed=$4 mac=$5
@@ -84,6 +95,7 @@ create_vm() {
 }
 create_vm k8s-cp01 3072 "$DISK_DIR/k8s-cp01.qcow2" "$SEED_DIR/cp-seed.iso" "$CP_MAC"
 create_vm k8s-worker01 2048 "$DISK_DIR/k8s-worker01.qcow2" "$SEED_DIR/worker-seed.iso" "$WORKER_MAC"
+if [[ $THREE_NODE == true ]]; then create_vm k8s-worker02 2048 "$DISK_DIR/k8s-worker02.qcow2" "$SEED_DIR/worker02-seed.iso" "$WORKER2_MAC"; fi
 
 vm_ip() {
   local name=$1 expected_ip=$2 ip=""
@@ -101,11 +113,14 @@ vm_ip() {
 
 CP_IP=$(vm_ip k8s-cp01 "$CP_STATIC_IP")
 WORKER_IP=$(vm_ip k8s-worker01 "$WORKER_STATIC_IP")
+WORKER2_IP=""
+if [[ $THREE_NODE == true ]]; then WORKER2_IP=$(vm_ip k8s-worker02 "$WORKER2_STATIC_IP"); fi
 # VM IPs can be recycled after recreation. Keep their fingerprints separate from
 # the user's normal known_hosts and clear only the two new lab addresses.
 touch "$KNOWN_HOSTS"
 ssh-keygen -R "$CP_IP" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
 ssh-keygen -R "$WORKER_IP" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
+if [[ -n $WORKER2_IP ]]; then ssh-keygen -R "$WORKER2_IP" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true; fi
 SSH=(ssh -i "$KEY" -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new)
 wait_for_ssh() {
   local node=$1
@@ -122,8 +137,10 @@ wait_for_cloud_init() {
 }
 wait_for_ssh "$CP_IP"
 wait_for_ssh "$WORKER_IP"
+if [[ -n $WORKER2_IP ]]; then wait_for_ssh "$WORKER2_IP"; fi
 wait_for_cloud_init "$CP_IP"
 wait_for_cloud_init "$WORKER_IP"
+if [[ -n $WORKER2_IP ]]; then wait_for_cloud_init "$WORKER2_IP"; fi
 
 setup_node() {
   "${SSH[@]}" lab@"$1" 'bash -s' <<EOF
@@ -157,6 +174,7 @@ EOF
 }
 setup_node "$CP_IP"
 setup_node "$WORKER_IP"
+if [[ -n $WORKER2_IP ]]; then setup_node "$WORKER2_IP"; fi
 
 INIT_COMMAND="sudo kubeadm init --apiserver-advertise-address=$CP_IP --pod-network-cidr=$POD_CIDR"
 if [[ -n $CONTROL_PLANE_ENDPOINT ]]; then
@@ -167,9 +185,11 @@ fi
 "${SSH[@]}" lab@"$CP_IP" 'kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.2/manifests/calico.yaml'
 JOIN_CMD=$("${SSH[@]}" lab@"$CP_IP" 'sudo kubeadm token create --print-join-command')
 "${SSH[@]}" lab@"$WORKER_IP" "sudo $JOIN_CMD"
+if [[ -n $WORKER2_IP ]]; then "${SSH[@]}" lab@"$WORKER2_IP" "sudo $JOIN_CMD"; fi
 "${SSH[@]}" lab@"$CP_IP" 'kubectl wait --for=condition=Ready nodes --all --timeout=300s && kubectl rollout status daemonset/calico-node -n kube-system --timeout=300s && kubectl rollout status deployment/calico-kube-controllers -n kube-system --timeout=300s && kubectl rollout status deployment/coredns -n kube-system --timeout=300s && kubectl get nodes -o wide && kubectl get pods -A'
 
 "${SSH[@]}" lab@"$CP_IP" 'kubectl label node k8s-worker01 node-role.kubernetes.io/worker="" --overwrite'
+if [[ -n $WORKER2_IP ]]; then "${SSH[@]}" lab@"$CP_IP" 'kubectl label node k8s-worker02 node-role.kubernetes.io/worker="" --overwrite'; fi
 if [[ -n $KUBECONFIG_TARGET ]]; then
   mkdir -p "$(dirname "$KUBECONFIG_TARGET")"
   temporary_kubeconfig=$(mktemp "${KUBECONFIG_TARGET}.XXXXXX")
@@ -179,4 +199,4 @@ if [[ -n $KUBECONFIG_TARGET ]]; then
   kubectl --kubeconfig "$KUBECONFIG_TARGET" get nodes >/dev/null
 fi
 
-echo "Cluster ready. Control plane: $CP_IP; worker: $WORKER_IP"
+echo "Cluster ready. Control plane: $CP_IP; worker: $WORKER_IP${WORKER2_IP:+; worker: $WORKER2_IP}"

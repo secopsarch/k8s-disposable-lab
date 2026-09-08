@@ -12,7 +12,7 @@ elif [[ $# -gt 0 ]]; then
   exit 2
 fi
 
-for domain in k8s-worker01 k8s-cp01; do
+for domain in k8s-worker02 k8s-worker01 k8s-cp01; do
   if sudo virsh dominfo "$domain" >/dev/null 2>&1; then
     state=$(sudo virsh domstate "$domain" | tr -d '\r')
     if [[ $state == running || $state == paused ]]; then
@@ -28,9 +28,11 @@ if [[ $PURGE == true ]]; then
     "$ROOT_DIR/disks/k8s-cp01.qcow2" \
     "$ROOT_DIR/disks/k8s-cp01-rebuild.qcow2" \
     "$ROOT_DIR/disks/k8s-worker01.qcow2" \
+    "$ROOT_DIR/disks/k8s-worker02.qcow2" \
     "$ROOT_DIR/seed/cp-seed.iso" \
     "$ROOT_DIR/seed/cp-seed-fixed.iso" \
     "$ROOT_DIR/seed/worker-seed.iso" \
+    "$ROOT_DIR/seed/worker02-seed.iso" \
     "$ROOT_DIR/seed/worker-seed-fixed.iso"
   echo "Purged disposable VM overlays and generated seed ISOs."
 else

@@ -3,11 +3,19 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-MODE="${1:---dedicated}"
-case "$MODE" in
-  --dedicated|--default) ;;
-  *) echo "Usage: $0 [--dedicated|--default]" >&2; exit 2 ;;
-esac
+MODE="--dedicated"
+THREE_NODE=false
+for argument in "$@"; do
+  case "$argument" in
+    --dedicated|--default) MODE="$argument" ;;
+    --three-node) THREE_NODE=true ;;
+    *) echo "Usage: $0 [--dedicated|--default] [--three-node]" >&2; exit 2 ;;
+  esac
+done
+if [[ $THREE_NODE == true && $MODE != "--dedicated" ]]; then
+  echo "--three-node is supported only with --dedicated" >&2
+  exit 2
+fi
 
 failures=0
 warnings=0
@@ -54,10 +62,19 @@ if getent passwd libvirt-qemu >/dev/null; then
 fi
 
 available_mib=$(awk '/MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
-if (( available_mib >= 7168 )); then ok "Available WSL memory: ${available_mib} MiB"; else warn "Available WSL memory: ${available_mib} MiB; 7 GiB+ is recommended"; fi
+recommended_memory_mib=7168
+recommended_disk_mib=51200
+if [[ $THREE_NODE == true ]]; then
+  recommended_memory_mib=9216
+  recommended_disk_mib=71680
+fi
+if (( available_mib >= recommended_memory_mib )); then ok "Available WSL memory: ${available_mib} MiB"; else warn "Available WSL memory: ${available_mib} MiB; $(( recommended_memory_mib / 1024 )) GiB+ is recommended for this topology"; fi
+
+host_cpus=$(nproc)
+if (( host_cpus >= 8 )); then ok "Available WSL CPUs: ${host_cpus}"; else warn "Available WSL CPUs: ${host_cpus}; 8+ are recommended for this topology"; fi
 
 available_disk_mib=$(df -Pm "$ROOT_DIR" | awk 'NR == 2 {print $4}')
-if (( available_disk_mib >= 51200 )); then ok "Available workspace disk: ${available_disk_mib} MiB"; else warn "Available workspace disk: ${available_disk_mib} MiB; 50 GiB+ is recommended"; fi
+if (( available_disk_mib >= recommended_disk_mib )); then ok "Available workspace disk: ${available_disk_mib} MiB"; else warn "Available workspace disk: ${available_disk_mib} MiB; $(( recommended_disk_mib / 1024 )) GiB+ is recommended for this topology"; fi
 
 if curl -fsSI --connect-timeout 8 https://cloud-images.ubuntu.com/noble/current/ >/dev/null; then
   ok "Ubuntu cloud-image endpoint is reachable"
@@ -77,7 +94,7 @@ else
   fi
 fi
 
-active_domains=$(sudo virsh list --name 2>/dev/null | grep -E '^(k8s-cp01|k8s-worker01)$' || true)
+active_domains=$(sudo virsh list --name 2>/dev/null | grep -E '^(k8s-cp01|k8s-worker01|k8s-worker02)$' || true)
 if [[ -n $active_domains ]]; then
   warn "Existing lab domains will be destroyed by a recreate script: ${active_domains//$'\n'/, }"
 else

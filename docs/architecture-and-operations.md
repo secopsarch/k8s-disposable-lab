@@ -6,7 +6,7 @@ The current cluster proves that KVM inside WSL2 works. For a **disposable cluste
 
 | Network role | CIDR | Stable addresses |
 | --- | --- | --- |
-| Libvirt node network | `192.168.56.0/24` | Gateway `192.168.56.1`; CP `192.168.56.10` / `52:54:00:56:00:10`; worker `192.168.56.11` / `52:54:00:56:00:11` |
+| Libvirt node network | `192.168.56.0/24` | Gateway `192.168.56.1`; CP `192.168.56.10` / `52:54:00:56:00:10`; worker01 `192.168.56.11` / `52:54:00:56:00:11`; worker02 `192.168.56.12` / `52:54:00:56:00:12` in three-node mode |
 | Kubernetes Service CIDR | `10.96.0.0/12` | Kubernetes default Service range |
 | Kubernetes Pod CIDR | `10.244.0.0/16` | Calico workload addresses |
 
@@ -18,7 +18,7 @@ These ranges do not overlap. Libvirt DHCP reservations, tied to fixed VM MAC add
 flowchart LR
     P[preflight.sh --dedicated<br/>read-only validation] --> N[recreate-dedicated-network.sh]
     N --> NET[Define cka-net<br/>NAT + DHCP reservations]
-    NET --> VM[Create cp01 and worker01 VMs]
+    NET --> VM[Create cp01 and one or two worker VMs]
     VM --> BOOT[Install node dependencies<br/>kubeadm + Calico]
     BOOT --> VALIDATE[Ready nodes + Calico + CoreDNS]
     VALIDATE --> KC[Refresh ~/.kube/cka-lab<br/>validate kubectl]
@@ -35,19 +35,22 @@ flowchart TB
     preflight --> hypervisor["KVM and libvirt"]
     hypervisor --> network["cka-net 192.168.56.0/24"]
     network --> controlplane["k8s-cp01 192.168.56.10"]
-    network --> worker["k8s-worker01 192.168.56.11"]
+    network --> workerone["k8s-worker01 192.168.56.11"]
+    network --> workertwo["k8s-worker02 192.168.56.12 optional"]
     controlplane --> apiserver["kube-apiserver TCP 6443"]
     controlplane --> etcd["etcd"]
     controlplane --> controller["controller-manager"]
     controlplane --> scheduler["scheduler"]
     controlplane --> cpnode["kubelet and containerd"]
-    worker --> workernode["kubelet and containerd"]
-    controlplane --- worker
+    workerone --> workeronenode["kubelet and containerd"]
+    workertwo --> workertwonode["kubelet and containerd"]
+    controlplane --- workerone
+    controlplane --- workertwo
     wsl --> kubeconfig["kubeconfig cka-lab"]
     kubeconfig --> apiserver
 ```
 
-The direct control-plane-to-worker link carries node API traffic on TCP 6443 and Calico Pod traffic for `10.244.0.0/16`.
+The direct control-plane-to-worker links carry node API traffic on TCP 6443 and Calico Pod traffic for `10.244.0.0/16`. `k8s-worker02` exists only when the three-node workflow is selected.
 
 ## Node bootstrap chain
 
@@ -59,9 +62,9 @@ flowchart LR
     KA[kubeadm] --> INIT[kubeadm init on cp01]
     INIT --> API[Control-plane static Pods]
     API --> CNI[Calico CNI]
-    CNI --> JOIN[kubeadm join on worker01]
-    JOIN --> ROLE[worker role label]
-    ROLE --> READY[Both nodes Ready]
+    CNI --> JOIN[kubeadm join on each worker]
+    JOIN --> ROLE[worker role labels]
+    ROLE --> READY[All requested nodes Ready]
     READY --> KCFG[Refresh ~/.kube/cka-lab]
 ```
 
@@ -71,15 +74,19 @@ flowchart LR
 sequenceDiagram
     participant O as WSL operator host
     participant CP as k8s-cp01 .10
-    participant WK as k8s-worker01 .11
+    participant WK1 as k8s-worker01 .11
+    participant WK2 as k8s-worker02 .12 optional
     participant C as Calico Pod network
 
     O->>CP: SSH TCP/22
     O->>CP: kubectl → API TCP/6443 via ~/.kube/cka-lab
-    WK->>CP: kubelet → API TCP/6443
-    CP-->>WK: control-plane responses
+    WK1->>CP: kubelet → API TCP/6443
+    WK2->>CP: kubelet → API TCP/6443
+    CP-->>WK1: control-plane responses
+    CP-->>WK2: control-plane responses
     CP->>C: Pod traffic
-    WK->>C: Pod traffic
+    WK1->>C: Pod traffic
+    WK2->>C: Pod traffic
 ```
 
 The WSL Ubuntu distribution is the operator host. It can route directly to both addresses through libvirt's `cka-net` bridge. The Windows layer is outside the lab control path; this design intentionally uses WSL commands and kubeconfig rather than a Windows-native access workflow.
@@ -145,21 +152,40 @@ Host k8s-worker01
   HostName 192.168.56.11
   User lab
   IdentityFile ~/.ssh/cka_lab
+
+Host k8s-worker02
+  HostName 192.168.56.12
+  User lab
+  IdentityFile ~/.ssh/cka_lab
 ```
 
-Then use `ssh k8s-cp01`, `ssh k8s-worker01`, and `scp k8s-cp01:/home/lab/file .` from WSL.
+Then use `ssh k8s-cp01`, `ssh k8s-worker01`, optionally `ssh k8s-worker02`, and `scp k8s-cp01:/home/lab/file .` from WSL.
 
 ## Implemented dedicated lifecycle contract
 
 `recreate-dedicated-network.sh` implements the following without changing the three CIDRs:
 
 1. Define and autostart `cka-net` with gateway `192.168.56.1`.
-2. Assign immutable MAC addresses `52:54:00:56:00:10` and `52:54:00:56:00:11`, with matching DHCP reservations for `.10` and `.11`.
-3. Attach both VMs to `cka-net`, not libvirt `default`.
+2. Assign immutable MAC addresses `52:54:00:56:00:10` and `52:54:00:56:00:11`, with matching DHCP reservations for `.10` and `.11`. Three-node mode adds `52:54:00:56:00:12` and `.12`.
+3. Attach every requested VM to `cka-net`, not libvirt `default`.
 4. Initialize kubeadm with `--control-plane-endpoint 192.168.56.10:6443`.
-5. Refresh `~/.kube/cka-lab` only after Calico, CoreDNS, and both nodes are Ready.
+5. Refresh `~/.kube/cka-lab` only after Calico, CoreDNS, and every requested node are Ready.
 6. Validate host access with `kubectl --kubeconfig ~/.kube/cka-lab get nodes`.
-7. Label the joined worker with `node-role.kubernetes.io/worker=""`; this is a display/scheduling-organizational label, not a requirement for worker operation.
+7. Label every joined worker with `node-role.kubernetes.io/worker=""`; this is a display/scheduling-organizational label, not a requirement for worker operation.
+
+## Three-node dedicated workflow
+
+Use the existing dedicated workflow with `--three-node`; it is deliberately opt-in so the two-node CKA build remains fast and resource-light.
+
+```bash
+./preflight.sh --dedicated --three-node
+./recreate-dedicated-network.sh --three-node
+kubectl --kubeconfig ~/.kube/cka-lab get nodes -o wide
+```
+
+The topology reserves 7 GiB of VM memory and six vCPUs: 3 GiB/2 vCPUs for the control plane and 2 GiB/2 vCPUs for each worker. Preflight therefore recommends at least 9 GiB free WSL memory, eight WSL vCPUs, and 70 GiB free workspace storage. It warns rather than changes WSL allocation. `destroy.sh` and `destroy.sh --purge` remove `k8s-worker02` and its generated overlay/seed ISO when it exists.
+
+If a previous interrupted libvirt teardown leaves `virbr56` behind, the recreation workflow removes only that fixed lab bridge and only when it has no attached interfaces. It fails closed and lists the interfaces if the bridge is still in use.
 
 ## Controlled break and recover lab plan
 
