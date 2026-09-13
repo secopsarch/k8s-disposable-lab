@@ -147,6 +147,18 @@ setup_node() {
 set -euo pipefail
 sudo swapoff -a
 sudo sed -ri '/\\sswap\\s/s/^#?/#/' /etc/fstab
+# Some upstream or corporate paths block plaintext HTTP. Ubuntu cloud images
+# use HTTP mirrors by default, while HTTPS remains available through libvirt NAT.
+sudo sed -i \
+  -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+  -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+  /etc/apt/sources.list.d/ubuntu.sources
+cat <<'APT' | sudo tee /etc/apt/apt.conf.d/99cka-lab-network >/dev/null
+Acquire::ForceIPv4 "true";
+Acquire::Retries "2";
+Acquire::http::Timeout "15";
+Acquire::https::Timeout "15";
+APT
 printf '%s\\n' overlay br_netfilter | sudo tee /etc/modules-load.d/k8s.conf
 sudo modprobe overlay
 sudo modprobe br_netfilter
@@ -156,8 +168,8 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward = 1
 SYSCTL
 sudo sysctl --system
-sudo apt update
-sudo apt install -y ca-certificates curl gpg containerd
+sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gpg containerd
 sudo mkdir -p /etc/containerd
 containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -166,8 +178,8 @@ sudo systemctl restart containerd
 sudo mkdir -p -m 755 /etc/apt/keyrings
 curl -fsSL https://pkgs.k8s.io/core:/stable:/$K8S_MINOR/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$K8S_MINOR/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt update
-sudo apt install -y kubelet kubeadm kubectl
+sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 sudo systemctl enable --now kubelet
 EOF
@@ -175,6 +187,16 @@ EOF
 setup_node "$CP_IP"
 setup_node "$WORKER_IP"
 if [[ -n $WORKER2_IP ]]; then setup_node "$WORKER2_IP"; fi
+
+validate_node_egress() {
+  local node=$1
+  echo "Validating DNS and HTTPS egress from $node"
+  "${SSH[@]}" -n -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 lab@"$node" \
+    "getent hosts pkgs.k8s.io >/dev/null && curl -4fsSL --connect-timeout 10 --max-time 30 -o /dev/null https://pkgs.k8s.io/core:/stable:/$K8S_MINOR/deb/Release"
+}
+validate_node_egress "$CP_IP"
+validate_node_egress "$WORKER_IP"
+if [[ -n $WORKER2_IP ]]; then validate_node_egress "$WORKER2_IP"; fi
 
 INIT_COMMAND="sudo kubeadm init --apiserver-advertise-address=$CP_IP --pod-network-cidr=$POD_CIDR"
 if [[ -n $CONTROL_PLANE_ENDPOINT ]]; then

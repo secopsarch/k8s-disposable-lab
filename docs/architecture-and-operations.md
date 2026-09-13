@@ -91,6 +91,12 @@ sequenceDiagram
 
 The WSL Ubuntu distribution is the operator host. It can route directly to both addresses through libvirt's `cka-net` bridge. The Windows layer is outside the lab control path; this design intentionally uses WSL commands and kubeconfig rather than a Windows-native access workflow.
 
+Libvirt NAT provides guest Internet egress through `192.168.56.1`. The recreation workflow verifies DNS resolution and HTTPS access to the configured Kubernetes package repository from every requested VM before cluster initialization: control plane plus worker01 in two-node mode, and control plane plus both workers in three-node mode. Calico and CoreDNS rollout validation then confirms container-image egress as part of cluster readiness.
+
+The bootstrap changes the Ubuntu 24.04 cloud image's default `http://archive.ubuntu.com` and `http://security.ubuntu.com` APT transport to HTTPS before package installation. This is intentional: the lab has observed an upstream path that permits HTTPS but does not return responses for plaintext HTTP. The change is inside each disposable guest, is applied in both topologies, and does not alter libvirt NAT, the static node addresses, or APT signature verification.
+
+Because `cka-net` provides IPv4 NAT and no IPv6 default route, the bootstrap configures APT to force IPv4, retry transient fetches twice, and fail a single HTTP/HTTPS connection after 15 seconds. It invokes `apt-get` noninteractively, avoiding non-TTY debconf prompts. The separate egress gate uses stdin-free SSH with keepalive and bounded curl timing rather than an outer timeout process, avoiding terminal job-control stops. These settings make the two-node and three-node workflows more predictable without bypassing package signature checks.
+
 ## Stable kubeconfig access from WSL
 
 ### Why the current default network is insufficient

@@ -121,17 +121,38 @@ kubectl --kubeconfig ~/.kube/cka-lab get nodes -o wide
 
 ### Automated wait and validation gates
 
-`recreate.sh` does not rely on a fixed sleep to declare success. It waits for each state that must be true before moving on:
+`recreate.sh` does not rely on a fixed sleep to declare success. It waits for each state that must be true before moving on. The egress check runs SSH without stdin and has explicit SSH keepalive plus curl connection/total-time limits, so it cannot be stopped by terminal job control:
 
 | Gate | Maximum wait | What it verifies |
 | --- | ---: | --- |
 | DHCP address per VM | 90 seconds | Libvirt has leased an IPv4 address to the new domain. |
 | SSH per VM | 120 seconds | `sshd` accepts the lab key. |
 | cloud-init per VM | 300 seconds | The hostname, SSH key, and guest agent configuration have completed. |
+| DNS and HTTPS egress per VM | 45 seconds | Resolves `pkgs.k8s.io` and downloads its configured Kubernetes release metadata through libvirt NAT. |
 | Kubernetes nodes | 300 seconds | Every requested node reports `Ready`. |
 | Calico and CoreDNS | 300 seconds each | The Calico DaemonSet, Calico controllers, and CoreDNS Deployment finish their rollouts. |
 
 Package downloads and `apt` installation depend on the available Internet connection, so they intentionally have no artificial timeout. A normal rebuild takes roughly 10–20 minutes. If a timed wait fails, the script exits non-zero rather than claiming the cluster is ready.
+
+The dedicated `cka-net` uses libvirt NAT through gateway `192.168.56.1`; it does not need a Windows route or any guest-side static route. A successful build proves Internet access twice: the per-node Kubernetes repository HTTPS gate succeeds before `kubeadm init`, and Calico/CoreDNS readiness proves required container images were pulled. During bootstrap, the script changes the Ubuntu cloud-image mirror URIs from HTTP to HTTPS before its first `apt update`; this prevents a blocked outbound TCP/80 path from stalling package installation while retaining signed APT metadata verification.
+
+### Predictable package-install timing
+
+`cka-net` is IPv4-only. The bootstrap therefore configures APT to use IPv4, HTTPS Ubuntu mirrors, two retries, and 15-second HTTP/HTTPS connection timeouts. It uses `apt-get` with `DEBIAN_FRONTEND=noninteractive`, which prevents the non-TTY `debconf` frontend message from looking like an interactive prompt. The `needrestart` messages about services, containers, and VM guests are informational and do not block the build.
+
+### Why `kubeadm upgrade plan` can show no newer version
+
+The recreation scripts intentionally configure `pkgs.k8s.io` for `stable:v1.35`, so `kubeadm upgrade plan` reports the newest available patch release in the v1.35 series. `sudo apt-mark unhold kubeadm` only allows package changes; it does not switch that configured repository to a new minor version. The message that a newer remote version exists followed by `falling back to: stable-1.35` is expected and confirms it reached the Internet.
+
+If an existing node predates this HTTPS-mirror bootstrap change and `apt-get update` waits indefinitely for headers, update its Ubuntu mirror URIs once, then retry. This affects only the guest's APT transport, not the dedicated network, cluster configuration, or Kubernetes package repository:
+
+```bash
+sudo sed -i \
+  -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+  -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+  /etc/apt/sources.list.d/ubuntu.sources
+sudo apt-get update
+```
 
 ## Daily lifecycle
 
@@ -198,6 +219,18 @@ Kubernetes overlay inside the VMs
 
 The VMs can reach package registries through libvirt NAT. Node-to-node Kubernetes traffic stays on the libvirt network. Calico supplies Pod networking; CoreDNS and workload Pods are not healthy until the CNI is installed.
 
+## What went wrong during the first build—and the fixes
+
+| Symptom | Cause | Permanent fix |
+| --- | --- | --- |
+| `cloud-localds: command not found` | Cloud-image tooling was absent | Install `cloud-image-utils`. |
+| SSH returned `Permission denied (publickey)` | User-data still contained a literal key placeholder | Generate user-data from `~/.ssh/cka_lab.pub`; `recreate.sh` does this every time. |
+| Cloud-init YAML looked valid but packages did not install | YAML indentation placed `packages` / `runcmd` inside the user item | Generate YAML using `printf` in the script, then validate with `cloud-init schema`. |
+| QEMU could not read files under `/home/devops` | The libvirt QEMU account could not traverse the private home directory | Grant only traversal: `sudo setfacl -m u:libvirt-qemu:--x "$HOME"`. |
+| `libvirtd` or `virtqemud` reported inactive | Ubuntu can use socket activation for modular libvirt daemons | Confirm `virsh -c qemu:///system uri`; the service activates when a domain starts. |
+| `virsh domifaddr` initially had no address | Guest agent had not reported yet | Use `sudo virsh net-dhcp-leases default`; cloud-init enables `qemu-guest-agent`. |
+| Worker was `NotReady` just after join | Calico and kube-proxy were still starting | Wait briefly and check `kubectl get pods -A`; this is normal during CNI initialization. |
+
 ## Troubleshooting commands
 
 ```bash
@@ -219,3 +252,9 @@ kubectl get pods -A -o wide
 kubectl get events -A --sort-by=.lastTimestamp
 ```
 
+## Optional next improvements
+
+- Add DHCP reservations for stable node IPs.
+- Snapshot a clean, Ready cluster with libvirt before failure drills.
+- Practice `kubeadm reset`, certificate inspection, node drains, CNI failures, kubelet failures, and container runtime failures.
+- Keep the base Ubuntu image read-only; all VM changes belong in disposable qcow2 overlays.
